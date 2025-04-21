@@ -110,6 +110,7 @@ struct BuildingLevel
 end
 
 all_levels = BuildingLevel[]
+prereq_map = Dict{Int, Vector{Any}}()
 
 # Define os níveis de cada prédio em sequência, como se cada nível fosse um prédio diferente
 # A questão aqui é que só vai ter um "prédio diferente" para um mesmo "gid" (que representa um prédio no jogo)
@@ -123,6 +124,12 @@ for b in buildings
             pop = lvl_data["population"]
             push!(all_levels, BuildingLevel(gid, name, lvl, time, pop))
         end
+    end
+
+    if haskey(b, :prerequisites)
+        prereq_map[b["gid"]] = b["prerequisites"]
+    else
+        prereq_map[b["gid"]] = Any[]  # sem pré‑requisitos
     end
 end
 model = Model(Gurobi.Optimizer)
@@ -155,6 +162,27 @@ end
 # Agora adiciona a restrição: no máximo um nível de cada prédio
 for (bname, indices) in building_groups
     @constraint(model, sum(x[i] for i in indices) <= 1)
+end
+
+# --- pré‑requisitos de construção ---
+for (i, lvl) in enumerate(all_levels)
+    # pega a lista de prereqs para este gid
+    for prereq in prereq_map[lvl.id]
+        if haskey(prereq, :type) && prereq.type == "Building"
+            # índice de todos os níveis possíveis que satisfazem
+            idxs = [ j for (j, l) in enumerate(all_levels)
+                     if (l.id in prereq.gid) && (l.level >= prereq.level) ]
+            # se x[i]=1, pelo menos um desses deve ser 1
+            @constraint(model, sum(x[j] for j in idxs) >= x[i])
+
+        elseif haskey(prereq, :type) && prereq.type == "NotBuilding"
+            # índice de todos os níveis dos prédios proibidos
+            excl = [ j for (j, l) in enumerate(all_levels)
+                     if l.id in prereq.gid ]
+            # x[i] e qualquer x[j in excl] não podem ambos ser 1
+            @constraint(model, x[i] + sum(x[j] for j in excl) <= 1)
+        end
+    end
 end
 
 # Objetivo: maximizar população total (pode trocar por cultura se quiser)
