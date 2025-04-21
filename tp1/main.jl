@@ -107,6 +107,8 @@ struct BuildingLevel
     level::Int64
     buildingTime::Float64
     population::Int64
+    cost::NTuple{4,Int} 
+    production::Vector{Int64}
 end
 
 all_levels = BuildingLevel[]
@@ -117,12 +119,29 @@ prereq_map = Dict{Int, Vector{Any}}()
 for b in buildings
     name = b["name"]
     gid = b["gid"]
+
     if haskey(b, "levelData")
         for (lvl_str, lvl_data) in b["levelData"]
             lvl = lvl_data["level"]
             time = lvl_data["buildingTime"]
             pop = lvl_data["population"]
-            push!(all_levels, BuildingLevel(gid, name, lvl, time, pop))
+            
+            rc = lvl_data["resourceCost"]
+            costs = (rc["r1"], rc["r2"], rc["r3"], rc["r4"])
+
+            production = [0, 0, 0, 0]
+
+            if gid == 1
+                production = [lvl_data["effects"]["production1"], 0, 0, 0]
+            elseif gid == 2
+                production = [0, lvl_data["effects"]["production2"], 0, 0]
+            elseif gid == 3
+                production = [0, 0, lvl_data["effects"]["production3"], 0]
+            elseif gid == 4
+                production = [0, 0, 0, lvl_data["effects"]["production4"]]
+            end
+
+            push!(all_levels, BuildingLevel(gid, name, lvl, time, pop, costs, production))
         end
     end
 
@@ -132,85 +151,125 @@ for b in buildings
         prereq_map[b["gid"]] = Any[]  # sem pré‑requisitos
     end
 end
-model = Model(Gurobi.Optimizer)
 
-# Cria uma variável para cada prédio
-@variable(model, x[1:length(all_levels)], Bin)
+n = length(all_levels)
+T = 72                                     # horizonte em horas
+MAX_SECONDS = 72*3600
 
+# arredonda para horas (sempre pra cima)
+build_hours = [ceil(Int, lvl.buildingTime/3600) for lvl in all_levels]
 
-level_times = Vector{Float64}(undef, length(all_levels))
-for (i, lvl) in enumerate(all_levels)
-    name = lvl.name
-    lvl_index = lvl.level
-
-    # pegar todos os níveis menores ou iguais
-    relevant = filter(x -> x.name == name && x.level <= lvl_index, all_levels)
-    level_times[i] = sum(x.buildingTime for x in relevant)
-end
-
-@constraint(model, sum(x[i] * level_times[i] for i in 1:length(x)) <= total_time)
-
-
-# Restrição: só pode escolher um nível por prédio
-# Cria um dicionário com índices dos níveis de cada prédio
-building_groups = Dict{String, Vector{Int}}()
-for (i, lvl) in enumerate(all_levels)
-    name = lvl.name
-    push!(get!(building_groups, name, Int[]), i)
-end
-
-# Agora adiciona a restrição: no máximo um nível de cada prédio
-for (bname, indices) in building_groups
-    @constraint(model, sum(x[i] for i in indices) <= 1)
-end
-
-# --- pré‑requisitos de construção ---
-for (i, lvl) in enumerate(all_levels)
-    # pega a lista de prereqs para este gid
-    for prereq in prereq_map[lvl.id]
-        if haskey(prereq, :type) && prereq.type == "Building"
-            # índice de todos os níveis possíveis que satisfazem
-            idxs = [ j for (j, l) in enumerate(all_levels)
-                     if (l.id in prereq.gid) && (l.level >= prereq.level) ]
-            # se x[i]=1, pelo menos um desses deve ser 1
-            @constraint(model, sum(x[j] for j in idxs) >= x[i])
-
-        elseif haskey(prereq, :type) && prereq.type == "NotBuilding"
-            # índice de todos os níveis dos prédios proibidos
-            excl = [ j for (j, l) in enumerate(all_levels)
-                     if l.id in prereq.gid ]
-            # x[i] e qualquer x[j in excl] não podem ambos ser 1
-            @constraint(model, x[i] + sum(x[j] for j in excl) <= 1)
-        end
+# índices de quais itens geram cada recurso r
+fields_of = Dict(r => Int[] for r in 1:4)
+for i in 1:n, r in 1:4
+    if all_levels[i].production[r] > 0
+        push!(fields_of[r], i)
     end
 end
 
-# Objetivo: maximizar população total (pode trocar por cultura se quiser)
-@objective(model, Max, sum(x[i] * all_levels[i].population for i in 1:length(x)))
+model = Model(Gurobi.Optimizer)
+
+# 1) decisão de iniciar o nível i exatamente na hora t
+@variable(model, x[1:n, 1:T], Bin)
+
+# 2) indicador de “já construído até t” (built[i,t] = 1 se terminou <= t)
+@variable(model, built[1:n, 0:T], Bin)
+
+# 3) estoque disponível de cada recurso r em cada t
+@variable(model, stock[1:4, 0:T] >= 0)
+
+#
+# ———————— Construção / Fila (até 2 simultâneas) ————————
+#
+# capacidade de slots egípcios
+for t in 1:T
+    @constraint(model,
+        sum( x[i,τ] for i in 1:n, τ in max(1,t-build_hours[i]+1):t ) ≤ 2
+    )
+end
+
+#
+# ———————— “built” a partir de “x” ————————
+#
+# se você inicia i em τ e demora h horas, então built[i, t]=1 para todo t≥τ+h-1
+for i in 1:n, t in 0:T
+    if t == 0
+        @constraint(model, built[i,0] == 0)
+    else
+        @constraint(model,
+            built[i,t] == sum( x[i, τ]
+                                for τ in 1:t
+                                if τ + build_hours[i] - 1 ≤ t )
+        )
+    end
+end
+
+#
+# ———————— Estoque dinâmico de recursos ————————
+#
+const INIT_RES = (750,750,750,750)
+# estoque inicial em t=0
+for r in 1:4
+    @constraint(model, stock[r,0] == INIT_RES[r])
+end
+
+# evolução horária
+for t in 1:T, r in 1:4
+    @constraint(model,
+      stock[r,t] == stock[r,t-1]
+                   # produção horária de todos os fields prontos até t-1
+                   + sum( all_levels[i].production[r] * built[i, t-1]
+                          for i in fields_of[r] )
+                   # menos o custo no instante de início (x[i,t])
+                   - sum( all_levels[i].cost[r] * x[i,t]
+                          for i in 1:n )
+    )
+    # nunca ultrapassar capacidade inicial de cada recurso
+    @constraint(model, stock[r,t] ≥ 0)
+end
+
+#
+# ———————— Só um nível por prédio ————————
+#
+groups = Dict{String,Vector{Int}}()
+for (i,lvl) in enumerate(all_levels)
+    push!( get!(groups, lvl.name, Int[]), i )
+end
+for idxs in values(groups)
+    @constraint(model, sum(x[i, t] for i in idxs, t in 1:T) ≤ 1)
+end
+
+#
+# ———————— Objetivo de exemplo (max pop) ————————
+#
+@objective(model, Max,
+    sum( all_levels[i].population * built[i,T] for i in 1:n )
+)
 
 optimize!(model)
 
-# println("Status: ", termination_status(model))
-t = 0.0
-for i in 1:length(all_levels)
-    if value(x[i]) > 0.5
-        lvl = all_levels[i]
-        println("Construir: ", lvl.name, " nível ", lvl.level, 
-                " (tempo acumulado: ", level_times[i], "s, pop: ", lvl.population, ")")
-        global t += level_times[i]
+println("\n>>> Plano de Construção (início em horas, duração em horas) <<<")
+    total_seconds = 0
+
+    # Para cada prédio‑nível i e cada hora t, se x[i,t] = 1…
+    for i in 1:n, t in 1:T
+        if value(x[i, t]) > 0.5
+            lvl = all_levels[i]
+            # build_hours[i] já era ceil(time/3600)
+            h_dur = build_hours[i]
+            total_seconds += lvl.buildingTime
+
+            println("– ", lvl.name,
+                    " | nível ", lvl.level,
+                    " | inicia em t=", t,
+                    "h, dura ", h_dur, "h (", lvl.buildingTime, "s)",
+                    " → pop +", lvl.population)
+        end
     end
-end
 
-println("Tempo total: ", t, "s (", round(t / 3600, digits=2), " horas)")
-
-
-
-
-
-
-
-
-
+    println("\nTempo total de “obra” (soma de todos os tempos de construção):")
+    println("   ", total_seconds, " segundos",
+            " (≈", round(total_seconds/3600, digits=2), " horas)")
 
 
 
