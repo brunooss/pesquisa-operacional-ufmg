@@ -154,7 +154,7 @@ end
 
 n = length(all_levels)
 T = 72                                     # horizonte em horas
-MAX_SECONDS = 72*3600
+MAX_SECONDS = T*3600
 
 # arredonda para horas (sempre pra cima)
 build_hours = [ceil(Int, lvl.buildingTime/3600) for lvl in all_levels]
@@ -207,7 +207,7 @@ end
 #
 # ———————— Estoque dinâmico de recursos ————————
 #
-const INIT_RES = (750,750,750,750)
+const INIT_RES = (750, 750, 750, 750)
 # estoque inicial em t=0
 for r in 1:4
     @constraint(model, stock[r,0] == INIT_RES[r])
@@ -240,6 +240,15 @@ for idxs in values(groups)
 end
 
 #
+# ———————— Necessário para ter 100 soldados ————————
+#
+REQUIRED_FINAL_STOCK = [4500, 6000, 3000, 1500]  # [r1, r2, r3, r4]
+
+for r in 1:4
+    @constraint(model, stock[r, T] >= REQUIRED_FINAL_STOCK[r])
+end
+
+#
 # ———————— Objetivo de exemplo (max pop) ————————
 #
 @objective(model, Max,
@@ -248,28 +257,6 @@ end
 
 optimize!(model)
 
-println("\n>>> Plano de Construção (início em horas, duração em horas) <<<")
-    total_seconds = 0
-
-    # Para cada prédio‑nível i e cada hora t, se x[i,t] = 1…
-    for i in 1:n, t in 1:T
-        if value(x[i, t]) > 0.5
-            lvl = all_levels[i]
-            # build_hours[i] já era ceil(time/3600)
-            h_dur = build_hours[i]
-            total_seconds += lvl.buildingTime
-
-            println("– ", lvl.name,
-                    " | nível ", lvl.level,
-                    " | inicia em t=", t,
-                    "h, dura ", h_dur, "h (", lvl.buildingTime, "s)",
-                    " → pop +", lvl.population)
-        end
-    end
-
-    println("\nTempo total de “obra” (soma de todos os tempos de construção):")
-    println("   ", total_seconds, " segundos",
-            " (≈", round(total_seconds/3600, digits=2), " horas)")
 
 
 
